@@ -1,2 +1,2 @@
 # snake
-An implementation of the game "Snake" with a  rudimentary computer AI player.
+An implementation of the game "Snake" in Racket.
