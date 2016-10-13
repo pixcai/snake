@@ -1,195 +1,272 @@
 #lang racket/gui
 
-(require "snake.rkt" racket/undefined)
+(require "snake.rkt")
 
-(define-values (GRID-SIZE WORLD-SIZE SNAKE-SPEED) (values 20 30 360))
-(define WINDOW-SIZE (* GRID-SIZE WORLD-SIZE))
+(struct size (width height) #:mutable)
 
-;; variables
-(define-values (snake-stopped? snake-failed? snake snake-food snake-direction)
-  (values #f undefined undefined undefined 'N))
+(define-values (cell world) (values (size 20 20) (size 30 30)))
 
-;; window
-(define snake-game
-  (new frame% [label "SNAKE"] [width WINDOW-SIZE] [height WINDOW-SIZE]))
+(define frame
+  (size (* (size-width cell) (size-width world)) (* (size-height cell) (size-height world))))
 
-;; initialize
-(define (snake-game-init)
-  (let* ([xy (quotient WORLD-SIZE 2)])
-    (set! snake-stopped? #f) (set! snake-failed? #f)
-    (set! snake (make-object snake+c% (grid GRID-SIZE GRID-SIZE) xy xy))
-    (set! snake-food (random-food)) (send snake-timer start SNAKE-SPEED)))
+(define snake-frame
+  (new frame%
+       [label "SNAKE"]
+       [width (size-width frame)]
+       [height (size-height frame)]
+       [min-width (size-width frame)]
+       [min-height (size-height frame)]))
 
-;; failed
-(define (snake-failed-dialog)
-  (let* ([failed-text "GAME OVER"]
-         [tips-text "PRESS ENTER TO RESTART"]
-         [failed-font (make-object font% 20 'system)]
-         [dc (send snake-canvas get-dc)])
-    (send dc set-font failed-font)
-    (define-values (failed-width failed-height failed-distance failed-extra)
-      (send dc get-text-extent failed-text))
-    (define-values (tips-width tips-height tips-distance tips-extra)
-      (send dc get-text-extent tips-text))
-    (let* ([block-height (+ failed-height tips-height)]
-           [dialog-height (* block-height 3)]
-           [y (/ (- WINDOW-SIZE dialog-height) 3)]
-           [failed-x (/ (- WINDOW-SIZE failed-width) 2)]
-           [failed-y (/ (- WINDOW-SIZE failed-height) 3)]
-           [tips-x (/ (- WINDOW-SIZE tips-width) 2)]
-           [tips-y (+ failed-y failed-height tips-height)]
-           [color (make-object color% #xff #xff #xff)]
-           [style 'solid])
-      (send dc set-brush color style)
-      (send dc draw-rectangle 0 y WINDOW-SIZE dialog-height)
-      (send dc set-font failed-font)
-      (send dc set-text-foreground (send (send dc get-pen) get-color))
-      (send dc draw-text failed-text failed-x failed-y)
-      (send dc draw-text tips-text tips-x tips-y))))
+(define-struct/contract (snake-food-with-type snake-food+c)
+  ([type (symbols 'nul 'speed 'penetrate)]))
 
-(define-struct food (x y color) #:transparent)
+(define snake%
+  (class snake+c+abstract%
+    (inherit-field head body)
+    (define/override (eat food)
+      (case (snake-food-with-type-type food)
+        [(nul) (begin (when snake-speedup?
+                        (send snake-timer stop)
+                        (send snake-timer start snake-speed))
+                      (when (or snake-speedup? snake-penetrating?)
+                        (send snake unset-body-color)
+                        (when snake-speedup?
+                          (set! snake-speedup? #f))
+                        (when snake-penetrating?
+                          (set! snake-penetrating? #f)))
+                      (super eat food))]
+        [(speed) (begin (if snake-penetrating?
+                          (begin (send snake unset-body-color)
+                                 (send snake set-body-color (send the-color-database find-color "blue")))
+                          (begin (unless snake-speedup?
+                                   (send snake set-body-color (send the-color-database find-color "green"))
+                                   (send snake-timer stop)
+                                   (send snake-timer start (/ snake-speed 4)))))
+                        (set! snake-speedup? #t))]
+        [(penetrate) (begin (if snake-speedup?
+                              (begin (send snake unset-body-color)
+                                     ((send snake set-body-color (send the-color-database find-color "blue"))))
+                              (begin (unless snake-penetrating?
+                                       (send snake set-body-color (send the-color-database find-color "red")))))
+                            (set! snake-penetrating? #t))]))
+    (define/override (draw dc)
+      (let ([cell-width (size-width cell)]
+            [cell-height (size-height cell)]
+            [old-pen (send dc get-pen)]
+            [old-brush (send dc get-brush)])
+        (send dc set-pen (snake-node-color head) (/ (min cell-width cell-height) 4) 'solid)
+        (send dc set-brush (snake-node-color head) 'transparent)
+        (send dc draw-ellipse (* (snake-node-x head) cell-width) (* (snake-node-y head) cell-height) cell-width cell-height)
+        (send dc set-pen old-pen)
+        (for/list ([node (in-list body)])
+          (send dc set-brush (snake-node-color node) 'solid)
+          (send dc draw-ellipse (* (snake-node-x node) cell-width) (* (snake-node-y node) cell-height) cell-width cell-height))
+        (send dc set-brush old-brush)))
+    (super-new)))
 
-;; generate a food that has a random position and color
-(define (random-food)
+(require racket/undefined)
+
+(define snake undefined)
+
+(define (random-snake-food)
+  (let-values ([(world-width world-height) (values (size-width world) (size-height world))])
+    (define food-position
+      (let ([maybe-positions empty])
+        (for ([x (in-range world-width)] #:when #t [y (in-range world-height)])
+          (when (empty? (filter (lambda (node) (and (= (snake-node-x node) x) (= (snake-node-y node) y)))
+                                (send snake get-nodes)))
+            (set! maybe-positions (append maybe-positions (list (cons x y))))))
+        (list-ref maybe-positions (random (length maybe-positions)))))
+    (make-snake-food-with-type (car food-position)
+                               (cdr food-position)
+                               (make-object color% (random 255) (random 255) (random 255))
+                               (let ([p (random 100)])
+                                 (cond [(<= p 10) 'speed]
+                                       [(and (> p 10) (< p 90)) 'nul]
+                                       [(>= p 90) 'penetrate])))))
+
+(define-values (snake-food
+                snake-speed
+                snake-direction
+                snake-init?
+                snake-died?
+                snake-pause?
+                snake-guide?
+                snake-speedup?
+                snake-penetrating?)
+  (values undefined
+          undefined
+          undefined
+          undefined
+          undefined
+          undefined
+          undefined
+          undefined
+          undefined))
+
+(define (snake-init)
   (begin
-    (define world (make-vector (* WORLD-SIZE WORLD-SIZE)))
-    (for ([i (in-range WORLD-SIZE)] #:when #t [j (in-range WORLD-SIZE)])
-      (vector-set! world (+ j (* WORLD-SIZE i)) (list j i)))
-    (let ([body (get-snake-body snake)])
-      (for/list ([node (in-list body)])
-        (set! world
-              (vector-filter-not
-               (lambda (item) (and (eq? (first item) (node-x node))
-                                   (eq? (last item) (node-y node))))
-               world))))
-    (let* ([seed (random (sub1 (vector-length world)))]
-           [point (vector-ref world seed)])
-      (food (first point) (last point)
-            (make-object color% (random #xff) (random #xff) (random #xff))))))
+    (set! snake (make-object snake% (quotient (size-width world) 2) (quotient (size-height world) 2)))
+    (set!-values (snake-food
+                  snake-speed
+                  snake-direction
+                  snake-init?
+                  snake-died?
+                  snake-pause?
+                  snake-guide?
+                  snake-speedup?
+                  snake-penetrating?)
+                 (values (random-snake-food) 320 'up #t #f #f #f #f #f))))
 
-;; guide
-(define snake-guide? #f)
+(define (draw-dialog dc title text color)
+  (let*-values ([(title-font text-font)
+                (values (make-object font% 22 'default) (make-object font% 16 'default))]
+               [(title-width title-height title-distance title-extra)
+                (send dc get-text-extent title title-font)]
+               [(text-width text-height text-distance text-extra)
+                (send dc get-text-extent text text-font)]
+               [(frame-width frame-height)
+                (values (size-width frame) (size-height frame))])
+    (when (equal? color #f)
+      (set! color (make-object color% 0 0 0)))
+    (define old-pen (send dc get-pen))
+    (send dc set-pen color 1 'solid)
+    (send dc draw-rectangle 0 (* 1/3 frame-height) frame-width (* 1/3 frame-height))
+    (send dc set-font title-font)
+    (send dc draw-text title (* 1/2 (- frame-width title-width)) (- (* 5/12 frame-height) (* 1/2 title-height)))
+    (send dc set-font text-font)
+    (send dc draw-text text (* 1/2 (- frame-width text-width)) (- (* 7/12 frame-height) text-height))
+    (send dc set-pen old-pen)))
 
 (define (snake-paint-callback canvas dc)
-  (let* ([food-color (food-color snake-food)]
-         [grid-color (make-object color% #xcc #xcc #xcc)]
-         [style 'solid]
-         [food-x (* GRID-SIZE (food-x snake-food))]
-         [food-y (* GRID-SIZE (food-y snake-food))])
-    (send dc set-pen grid-color 1 style)
-    ;; draw grid
-    (for ([i (in-range WORLD-SIZE)])
-      (send dc draw-line 0 (* GRID-SIZE i) WINDOW-SIZE (* GRID-SIZE i))
-      (send dc draw-line (* GRID-SIZE i) 0 (* GRID-SIZE i) WINDOW-SIZE))
-    ;; draw snake
-    (send snake draw canvas dc)
-    (send dc set-pen food-color 1 style)
-    (send dc set-brush food-color style)
-    ;; draw food
-    (send dc draw-ellipse food-x food-y GRID-SIZE GRID-SIZE)
-    ;; draw guide
-    (when snake-guide?
-      (let* ([guide-color (make-object color% 0 #xff 0)]
-             [guide-style 'long-dash]
-             [old-pen (send dc get-pen)]
-             [head (first (get-snake-body snake))]
-             [x1 (+ food-x (/ GRID-SIZE 2))]
-             [y1 (+ food-y (/ GRID-SIZE 2))]
-             [x2 (+ (* (node-x head) GRID-SIZE) (/ GRID-SIZE 2))]
-             [y2 (+ (* (node-y head) GRID-SIZE) (/ GRID-SIZE 2))])
-        (send dc set-pen (send old-pen get-color) 1 guide-style)
-        (send dc draw-line x1 y1 x2 y2)
-        (send dc set-pen old-pen)))))
-
-;; pause
-(define (snake-stopped-dialog)
-  (let* ([pause-text "GAME PAUSE"]
-         [pause-font (make-object font% 20 'system)]
-         [dc (send snake-canvas get-dc)])
-    (send dc set-font pause-font)
-    (define-values (pause-width pause-height pause-distance pause-extra)
-      (send dc get-text-extent pause-text))
-    (let* ([x (/ (- WINDOW-SIZE pause-width) 2)]
-           [y (/ (- WINDOW-SIZE pause-height) 3)]
-           [dialog-height (* pause-height 3)]
-           [color (make-object color% #xff #xff #xff)]
-           [style 'solid]
-           [dc (send snake-canvas get-dc)])
-      (send dc set-brush color style)
-      (send dc draw-rectangle 0 (- y pause-height) WINDOW-SIZE dialog-height)
-      (send dc set-text-foreground (send (send dc get-pen) get-color))
-      (send dc draw-text pause-text x y))))
-
-(define snake-canvas
-  (new (class canvas%
-         (super-new)
-         ;; handling keyboard events
-         (define/override (on-char ch)
-           (case (send ch get-key-code)
-             [(#\w    up) (set! snake-direction 'N)]
-             [(#\s  down) (set! snake-direction 'S)]
-             [(#\a  left) (set! snake-direction 'W)]
-             [(#\d right) (set! snake-direction 'E)]
-             [(#\return )
-              (if snake-failed?
-                  (snake-game-init)
-                  ;; pause
-                  (if (not snake-stopped?)
-                      (begin (set! snake-stopped? #t)
-                             (send snake-timer stop) (snake-stopped-dialog))
-                      (begin (set! snake-stopped? #f)
-                             (send snake-timer start SNAKE-SPEED))))])))
-       [parent snake-game]
-       [paint-callback snake-paint-callback]))
-
-;; active canvas
-(send snake-canvas focus)
+  (let ([cell-width (size-width cell)]
+        [cell-height (size-height cell)]
+        [frame-width (size-width frame)]
+        [frame-height (size-height frame)])
+    (send dc set-smoothing 'aligned)
+    (let draw-cell ([old-pen (send dc get-pen)]
+                    [cell-color (send the-color-database find-color "lightgray")])
+      (send dc set-pen cell-color 1 'solid)
+      (for ([i (in-range (size-width world))] #:when #t [j (in-range (size-height world))])
+        (send dc draw-line 0 (* cell-height j) frame-width (* cell-height j))
+        (send dc draw-line (* cell-width i) 0 (* cell-width i) frame-height))
+      (send dc set-pen old-pen))
+    (if snake-init?
+        (draw-dialog dc "SNAKE" "PRESS ENTER TO START" #f)
+        (begin
+          (send snake draw dc)
+          (let draw-snake-food ([food-x (* (snake-food+c-x snake-food) cell-width)]
+                                [food-y (* (snake-food+c-y snake-food) cell-height)]
+                                [old-brush (send dc get-brush)])
+            (send dc set-brush (snake-food+c-color snake-food) 'solid)
+            (if (equal? 'nul (snake-food-with-type-type snake-food))
+                (send dc draw-ellipse food-x food-y cell-width cell-height)
+                (send dc draw-rectangle food-x food-y cell-width cell-height))
+            (send dc set-brush old-brush))
+          (when snake-guide?
+            (let* ([old-pen (send dc get-pen)]
+                   [guide-color (send the-color-database find-color "black")]
+                   [food-center-x (* (+ (snake-food+c-x snake-food) 1/2) cell-width)]
+                   [food-center-y (* (+ (snake-food+c-y snake-food) 1/2) cell-height)]
+                   [head (first (send snake get-nodes))]
+                   [head-center-x (* (+ (snake-node-x head) 1/2) cell-width)]
+                   [head-center-y (* (+ (snake-node-y head) 1/2) cell-height)])
+              (send dc set-pen guide-color 4 'solid)
+              (send dc draw-point food-center-x food-center-y)
+              (send dc draw-point head-center-x head-center-y)
+              (send dc set-pen guide-color 1 'long-dash)
+              (send dc draw-line food-center-x food-center-y head-center-x head-center-y)
+              (send dc set-pen old-pen)))
+          (when snake-pause?
+            (draw-dialog dc "GAME PAUSE" "PRESS ENTER TO CONTINUE" #f))
+          (when snake-died?
+            (draw-dialog dc "GAME OVER" "PRESS ENTER TO RESTART" #f))))))
 
 (define snake-timer
   (make-object timer%
     (lambda ()
-      ;; update position 
-      (send snake move snake-direction)
-      (define-values (head nodes)
-        (values (first (get-snake-body snake)) (rest (get-snake-body snake))))
-      (define-values (hx hy fx fy fc)
-        (values (node-x head) (node-y head)
-                (food-x snake-food) (food-y snake-food) (food-color snake-food)))
-      ;; eating food
-      (when (and (eq? hx fx) (eq? hy fy))
-        (send snake grow fc) (set! snake-food (random-food))
-        (set! fx (food-x snake-food)) (set! fy (food-y snake-food)))
-      ;; check bound
-      (unless (and (>= hy 0) (<= hy (sub1 WORLD-SIZE))
-                   (>= hx 0) (<= hx (sub1 WORLD-SIZE))
-                   (empty?
-                    (filter (lambda (node)
-                              (and (eq? (node-x node) hx)
-                                   (eq? (node-y node) hy)))
-                            nodes)))
-        (set! snake-failed? #t) (send snake-timer stop) (snake-failed-dialog))
-      ;; check if should show or not show guide
-      (let* ([min-x (min fx hx)] [max-x (max fx hx)]
-             [min-y (min fy hy)] [max-y (max fy hy)])
-        (cond
-          [(eq? min-x max-x)
-           (if (empty?
-                (filter (lambda (node)
-                          (let* ([nx (node-x node)] [ny (node-y node)])
-                            (and (eq? nx max-x) (> ny min-y) (< ny max-y))))
-                        nodes))
-             (set! snake-guide? #t) (set! snake-guide? #f))]
-          [(eq? min-y max-y)
-           (if (empty?
-                (filter (lambda (node)
-                          (let* ([nx (node-x node)] [ny (node-y node)])
-                            (and (eq? ny max-y) (> nx min-x) (< nx max-x))))
-                        nodes))
-             (set! snake-guide? #t) (set! snake-guide? #f))]
-          [else (set! snake-guide? #f)]))
-      ;; update canvas
-      (unless (or snake-failed? snake-stopped?) (send snake-canvas refresh-now)))))
+      (let ([world-width (size-width world)]
+            [world-height (size-height world)]
+            [head (first (send snake get-nodes))])
+        (send snake move snake-direction)
+        (define-values (nodes head-x head-y)
+          (values (rest (send snake get-nodes)) (snake-node-x head) (snake-node-y head)))
+        (let ([food-x (snake-food+c-x snake-food)]
+              [food-y (snake-food+c-y snake-food)])
+          (when (and (= head-x food-x)
+                     (= head-y food-y))
+            (send snake eat snake-food)
+            (set! snake-food (random-snake-food))
+            (set! food-x (snake-food+c-x snake-food))
+            (set! food-y (snake-food+c-y snake-food)))
+          (let ([guide? #f])
+            (when (= head-x food-x)
+              (set! guide? (empty? (filter
+                                    (lambda (node)
+                                      (and (= (snake-node-x node) head-x)
+                                           (> (snake-node-y node) (min head-y food-y))
+                                           (< (snake-node-y node) (max head-y food-y))))
+                                    nodes))))
+            (when (= head-y food-y)
+              (set! guide? (empty? (filter
+                                    (lambda (node)
+                                      (and (= (snake-node-y node) head-y)
+                                           (> (snake-node-x node) (min head-x food-x))
+                                           (< (snake-node-x node) (max head-x food-x))))
+                                    nodes))))
+            (if guide?
+                (set! snake-guide? #t)
+                (set! snake-guide? #f))))
+        (if snake-penetrating?
+            (begin (cond
+                     [(> head-x world-width) (set-snake-node-x! head 0)]
+                     [(< head-x 0) (set-snake-node-x! head (sub1 world-width))]
+                     [(> head-y world-height) (set-snake-node-y! head 0)]
+                     [(< head-y 0) (set-snake-node-y! head (sub1 world-height))]))
+            (unless (and (empty? (filter
+                              (lambda (node)
+                                (and (= (snake-node-x node) head-x)
+                                     (= (snake-node-y node) head-y)))
+                              nodes))
+                     (>= head-x 0)
+                     (< head-x world-width)
+                     (>= head-y 0)
+                     (< head-y world-height))
+              (set! snake-died? #t)))
+        (send snake-canvas refresh-now)
+        (when snake-died?
+          (send snake-timer stop))))))
 
-;; bootstrap
-(snake-game-init)
-(send snake-game show #t)
+(define snake-canvas%
+  (class canvas%
+    (define/override (on-char ch)
+      (case (send ch get-key-code)
+        [(#\a left) (unless (equal? snake-direction 'right)
+                      (set! snake-direction 'left))]
+        [(#\w up) (unless (equal? snake-direction 'down)
+                    (set! snake-direction 'up))]
+        [(#\d right) (unless (equal? snake-direction 'left)
+                       (set! snake-direction 'right))]
+        [(#\s down) (unless (equal? snake-direction 'up)
+                      (set! snake-direction 'down))]
+        [(#\return) (begin (if snake-init?
+                             (begin (snake-init)
+                                    (set! snake-init? #f)
+                                    (send snake-timer start snake-speed))
+                             (if snake-pause?
+                                 (begin (set! snake-pause? #f)
+                                        (send snake-timer start snake-speed))
+                                 (begin (set! snake-pause? #t)
+                                        (send snake-timer stop))))
+                           (when snake-died?
+                             (snake-init)
+                             (set! snake-died? #f)
+                             (send snake-timer start snake-speed))
+                           (send snake-canvas refresh-now))]))
+    (super-new)))
+
+(define snake-canvas
+  (make-object snake-canvas% snake-frame null snake-paint-callback))
+
+(send snake-canvas focus)
+(send snake-frame show #t)
